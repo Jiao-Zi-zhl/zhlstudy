@@ -1,0 +1,128 @@
+private void handleClient(Socket client) {
+        //test 分包
+        try {
+            InputStream in = socket.getInputStream();
+            ByteArrayOutputStream cacheBuffer = new ByteArrayOutputStream();
+
+            byte[] tempBuf = new byte[1024];
+            byte[] myshort = new byte[15];
+            int maxImageSize = 2 * 1024 * 1024; // 5MB最大限制
+
+            while (true) {
+                int len = in.read(tempBuf);
+                Log.d(TAG,"数据包长度："+len);
+                if (len <= 0) {
+                    Thread.sleep(10);
+                    continue;
+                }else if(len<11){
+                    Log.d(TAG,"数据过短 小包数据");
+                    // 不再调用 in.read()，直接从 tempBuf 中复制 len 字节
+                    byte[] myshortdata = Arrays.copyOf(tempBuf, len);
+
+                    if(len<=7&&len>=3){
+                        // 打印全部 myshort 的十六进制字符串
+                        StringBuilder hexStr = new StringBuilder();
+                        for (int i = 0; i < len; i++) {
+                            hexStr.append(String.format("%02X ", myshortdata[i]));
+                        }
+                        Log.d(TAG, "myshort 内容（Hex）：" + hexStr.toString().trim());
+                        int type = myshortdata[2] & 0xFF;
+                        if(type==0x02){
+                            byte[] carnumb = Arrays.copyOfRange(myshortdata,  3,  7);
+                            String scard = bytesToHex2(carnumb);
+                            //79b81e4e             //42e576f7
+                            long value = Long.parseUnsignedLong(scard, 16); // 解析成无符号long
+                            String hexUpper = Long.toHexString(value).toUpperCase();
+                            Log.d(TAG, "接收到类型02，删除卡号：" + hexUpper);
+                            CardManager cardManager = new CardManager(getApplicationContext(), "card_list.txt");
+                            cardManager.removeCard(hexUpper);
+                            Boolean b = FaceModelHelper.DeleOne(hexUpper);
+                            boolean b1 = deleteImageFile(hexUpper);
+                            Log.d(TAG, "删除卡号状态：" + b+"  删除本地图片："+b1);
+                            sendToClient(new byte[]{(byte) 0xCC, (byte) 0xEE, 0x02}, ip);
+                        }else if (type==0x07){
+                            Log.d(TAG, "接收到类型07，刷新预约");
+                            String keylabId = ALL_DATA_PROC.readFromFile(ALL_DATA_PROC.AllfileName, "keylabId");
+                            new HttpPostRequest().sendPostRequest(2, CMD_URL.getnewYuyue(), keylabId, response -> {
+                                Log.d(TAG, "预约列表更新完成");
+                                ALL_DATA_PROC.GetNewYuyue(response);
+                            });
+                            sendToClient(new byte[]{(byte) 0xCC, (byte) 0xEE, 0x07}, ip);
+                        }else if (type==0x03){
+                            Log.d(TAG, "接收到类型03，执行开门指令");
+                            InfoUtilApi.setElectricLock(1, true);
+                            InfoUtilApi.setElectricLock(1, false);
+                            sendToClient(new byte[]{(byte) 0xCC, (byte) 0xEE, 0x03}, ip);
+                        }
+                    }
+                    break;
+                }
+
+                cacheBuffer.write(tempBuf, 0, len);
+                byte[] data = cacheBuffer.toByteArray();
+                int offset = 0;
+                //帧头＋数据  3000
+                //数据
+                //数据+帧尾
+                //保证数据不会出现索引异常
+                while (data.length - offset >= 13) {
+                    // 帧头检查
+                    if ((data[offset] & 0xFF) != 0xCC || (data[offset + 1] & 0xFF) != 0xEE) {
+                        //Log.d(TAG, "帧头错误，跳过1字节");
+                        offset++;
+                        continue;
+                    }
+                    //小于数据长度时 才能继续访问索引后续数据
+                    if (offset + 13 > data.length) {
+                        //Log.d(TAG, "图片帧头不完整，等待更多数据");
+                        break;
+                    }
+
+                    int imageLen = byteArrayToInt(data, offset + 3);
+                    int cardId = byteArrayToInt(data, offset + 7);
+                    String cardIdHex = String.format("%08X", cardId);
+
+                    if (imageLen <= 0 || imageLen > maxImageSize) {
+                        //Log.d(TAG, "图片长度非法，跳过1字节");
+                        offset++;
+                        continue;
+                    }
+
+                    int fullFrameLen = imageLen ; // 帧头+长度/卡号+数据+帧尾
+                    //Log.d(TAG, "完整："+fullFrameLen+"   dataLength:"+data.length);
+                    if (offset + fullFrameLen > data.length) {
+                        //Log.d(TAG, "图片帧数据不完整，等待更多数据");
+                        break;
+                    }
+
+                    if ((data[offset + fullFrameLen - 2] & 0xFF) != 0xEE ||
+                            (data[offset + fullFrameLen - 1] & 0xFF) != 0xCC) {
+                        //Log.d(TAG, "图片帧帧尾错误，跳过1字节");
+                        offset++;
+                        continue;
+                    }
+
+                    // 提取图片数据
+                    byte[] imageData = Arrays.copyOfRange(data, offset + 11, offset + 11 + imageLen);
+
+                    // 保存并处理
+                    Log.d(TAG, "接收图片，卡号: " + cardIdHex + ", 图片大小: " + imageData.length);
+
+                    long value = Long.parseUnsignedLong(cardIdHex, 16); // 解析成无符号long
+                    String hexUpper = Long.toHexString(value).toUpperCase();
+                    saveImageWithFix(imageData, hexUpper, getApplicationContext());
+                    proc_facemode_card(hexUpper);
+
+                    offset += fullFrameLen;
+                }
+                if (offset > 0) {
+                    byte[] remaining = Arrays.copyOfRange(data, offset, data.length);
+                    cacheBuffer.reset();
+                    cacheBuffer.write(remaining);
+                    Log.d(TAG, "缓存区剩余数据长度: " + remaining.length);
+                }
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Socket处理异常", e);
+        }
+}
