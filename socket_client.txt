@@ -1,0 +1,183 @@
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.net.Socket;
+import java.net.InetSocketAddress;
+import java.util.Arrays;
+
+public class SocketClient {
+    private final String serverIp;
+    private final int serverPort;
+    private Socket socket;
+    private volatile boolean running = false;
+    private Thread recvThread;
+
+    public SocketClient(String serverIp, int serverPort) {
+        this.serverIp = serverIp;
+        this.serverPort = serverPort;
+    }
+
+    // 启动连接线程，自动断线重连
+    public synchronized void connect() {
+        if (running) {
+            System.out.println("Already connected or connecting...");
+            return;
+        }
+
+        running = true;
+
+        new Thread(() -> {
+            while (running) {
+                try {
+                    System.out.println("Trying to connect to " + serverIp + ":" + serverPort);
+                    socket = new Socket();
+                    socket.connect(new InetSocketAddress(serverIp, serverPort), 5000);
+                    System.out.println("Connected to server.");
+                    startReceive();
+                    break;  // 连接成功跳出重连循环
+                } catch (IOException e) {
+                    System.out.println("Connect failed, retry in 5 seconds.");
+                    closeSocket(); // 确保清理
+                    try {
+                        Thread.sleep(5000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
+                }
+            }
+        }, "Socket-Connect-Thread").start();
+    }
+
+    // 启动接收线程
+    private void startReceive() {
+        recvThread = new Thread(() -> {
+            try (InputStream in = socket.getInputStream()) {
+                byte[] buffer = new byte[4096];
+                int len;
+                byte[] leftover = new byte[0]; // 剩余未处理数据
+
+                while (running && (len = in.read(buffer)) != -1) {
+                    // 合并 leftover + 新读数据
+                    byte[] data = concat(leftover, Arrays.copyOf(buffer, len));
+
+                    int offset = 0;
+                    while (true) {
+                        // 简单示例：假设协议帧至少 4 字节，前2字节是帧头 0xCC 0xEE，接下来2字节是长度N，然后N字节数据
+                        if (data.length - offset < 4) break;
+
+                        if ((data[offset] & 0xFF) != 0xCC || (data[offset + 1] & 0xFF) != 0xEE) {
+                            offset++;
+                            continue;
+                        }
+
+                        int length = ((data[offset + 2] & 0xFF) << 8) | (data[offset + 3] & 0xFF);
+                        if (length < 0 || length > 10_000_000) {
+                            // 非法长度，跳过1字节
+                            offset++;
+                            continue;
+                        }
+
+                        if (data.length - offset < 4 + length) {
+                            // 数据包不完整，等下次接收
+                            break;
+                        }
+
+                        // 完整包
+                        byte[] packet = Arrays.copyOfRange(data, offset, offset + 4 + length);
+                        handlePacket(packet);
+
+                        offset += 4 + length;
+                    }
+
+                    // 剩余数据保存
+                    leftover = Arrays.copyOfRange(data, offset, data.length);
+                }
+            } catch (IOException e) {
+                if (running) {
+                    System.out.println("Connection lost, try to reconnect...");
+                    reconnect();
+                }
+            }
+        }, "Socket-Recv-Thread");
+
+        recvThread.start();
+    }
+
+    // 处理完整协议包
+    private void handlePacket(byte[] packet) {
+        // 解析协议并处理
+        System.out.println("Received packet: " + bytesToHex(packet));
+        // TODO: 具体业务处理代码
+    }
+
+    // 发送数据
+    public synchronized void sendData(byte[] data) {
+        if (socket == null || socket.isClosed() || !socket.isConnected()) {
+            System.out.println("Socket not connected, sending failed.");
+            return;
+        }
+
+        try {
+            OutputStream out = socket.getOutputStream();
+            out.write(data);
+            out.flush();
+            System.out.println("Sent data: " + bytesToHex(data));
+        } catch (IOException e) {
+            System.out.println("Send failed, reconnecting...");
+            reconnect();
+        }
+    }
+
+    // 关闭连接和线程
+    public synchronized void closeSocket() {
+        running = false;
+        try {
+            if (socket != null) socket.close();
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+        if (recvThread != null) {
+            recvThread.interrupt();
+            recvThread = null;
+        }
+    }
+
+    // 重新连接
+    private synchronized void reconnect() {
+        closeSocket();
+        connect();
+    }
+
+    // 工具方法：拼接两个byte数组
+    private static byte[] concat(byte[] a, byte[] b) {
+        byte[] c = new byte[a.length + b.length];
+        System.arraycopy(a, 0, c, 0, a.length);
+        System.arraycopy(b, 0, c, a.length, b.length);
+        return c;
+    }
+
+    // 工具方法：byte数组转16进制字符串
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder sb = new StringBuilder();
+        for (byte b : bytes) {
+            sb.append(String.format("%02X ", b));
+        }
+        return sb.toString().trim();
+    }
+
+    // 测试启动
+    public static void main(String[] args) throws InterruptedException {
+        SocketClient client = new SocketClient("127.0.0.1", 8888);
+        client.connect();
+
+        // 模拟发送数据
+        Thread.sleep(8000);
+        byte[] testPacket = new byte[]{(byte)0xCC, (byte)0xEE, 0x00, 0x05, 1,2,3,4,5};
+        client.sendData(testPacket);
+
+        // 运行60秒后关闭
+        Thread.sleep(60_000);
+        client.closeSocket();
+    }
+}
